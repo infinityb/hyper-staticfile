@@ -1,4 +1,4 @@
-use super::FileBytesStream;
+use super::{FileBytesStream, FileBytesStreamRange, FileBytesStreamMultiRange};
 use crate::util::DateTimeHttp;
 use chrono::{offset::Local as LocalTz, DateTime, SubsecRound};
 use http::response::Builder as ResponseBuilder;
@@ -138,49 +138,8 @@ impl FileResponseBuilder {
                         modified.timestamp(),
                         modified.timestamp_subsec_nanos()
                     ),
-                );
-        }
-
-        let mut status_code = StatusCode::OK;
-        let mut file_bytes_stream = FileBytesStream::new(file);
-
-        // Compute the ranges now that we have the file size, if we're multipart then
-        // we need a boundary too.
-       
-        if let Some(ref range) = self.range {
-            if let Ok(ranges) = HttpRange::parse(&range, metadata.len()) {
-                status_code = StatusCode::PARTIAL_CONTENT;
-                let mut boundary = String::new();
-
-                if ranges.len() == 1 {
-                    let single_span = ranges[0];
-                    res = res
-                        .header(header::CONTENT_RANGE,
-                            format!("bytes {}-{}/{}",
-                                single_span.start,
-                                single_span.start + single_span.length - 1,
-                                metadata.len()))
-                        .header(header::CONTENT_LENGTH, format!("{}", ranges[0].length));
-                } else if ranges.len() > 1 {
-                    let mut boundary_tmp = [0u8; BOUNDARY_LENGTH];
-
-                    let mut rng = thread_rng();
-                    for v in boundary_tmp.iter_mut() {
-                        // won't panic since BOUNDARY_CHARS is non-empty
-                        *v = *BOUNDARY_CHARS.choose(&mut rng).unwrap();
-                    }
-
-                    // won't panic because boundary_tmp is guaranteed to be all ASCII
-                    boundary = std::str::from_utf8(&boundary_tmp[..]).unwrap().to_string();
-
-                    res = res.header(hyper::header::CONTENT_TYPE,
-                        format!("multipart/byteranges; boundary={}", boundary));
-                }
-
-                file_bytes_stream.set_ranges(ranges, boundary, metadata.len());
-            }
-        } else {
-            res = res.header(header::CONTENT_LENGTH, format!("{}", metadata.len()));
+                )
+                .header(header::ACCEPT_RANGES, "bytes");
         }
 
         // Build remaining headers.
@@ -191,11 +150,50 @@ impl FileResponseBuilder {
             );
         }
 
-        // Stream the body.
-        res.status(status_code).body(if self.is_head {
-            Body::empty()
+        if self.is_head {
+            return res.status(StatusCode::OK).body(Body::empty());
+        }
+
+        // Compute the ranges now that we have the file size, if we're multipart then
+        // we need a boundary too.
+        if let Some(ref range) = self.range {
+            if let Ok(ranges) = HttpRange::parse(&range, metadata.len()) {
+                if ranges.len() == 1 {
+                    let single_span = ranges[0];
+                    res = res
+                        .header(header::CONTENT_RANGE,
+                            format!("bytes {}-{}/{}",
+                                single_span.start,
+                                single_span.start + single_span.length - 1,
+                                metadata.len()))
+                        .header(header::CONTENT_LENGTH, format!("{}", ranges[0].length));
+
+                    let body = FileBytesStreamRange::new(file, single_span).into_body();
+                    return res.status(StatusCode::PARTIAL_CONTENT).body(body)
+                } else if ranges.len() > 1 {
+                    let mut boundary_tmp = [0u8; BOUNDARY_LENGTH];
+
+                    let mut rng = thread_rng();
+                    for v in boundary_tmp.iter_mut() {
+                        // won't panic since BOUNDARY_CHARS is non-empty
+                        *v = *BOUNDARY_CHARS.choose(&mut rng).unwrap();
+                    }
+
+                    // won't panic because boundary_tmp is guaranteed to be all ASCII
+                    let boundary = std::str::from_utf8(&boundary_tmp[..]).unwrap().to_string();
+
+                    res = res.header(hyper::header::CONTENT_TYPE,
+                        format!("multipart/byteranges; boundary={}", boundary));
+
+                    let body = FileBytesStreamMultiRange::new(file, ranges, boundary, metadata.len()).into_body();
+                    return res.status(StatusCode::PARTIAL_CONTENT).body(body)
+                }
+            }
         } else {
-            file_bytes_stream.into_body()
-        })
+            res = res.header(header::CONTENT_LENGTH, format!("{}", metadata.len()));
+        }
+
+        // Stream the body.
+        res.status(StatusCode::OK).body(FileBytesStream::new(file).into_body())
     }
 }
