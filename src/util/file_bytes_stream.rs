@@ -69,6 +69,15 @@ impl FileBytesStream {
     }
 }
 
+#[derive(PartialEq, Eq)]
+enum FileSeekState {
+    NeedSeek,
+    Seeking,
+    Reading,
+}
+
+/// Wraps a `tokio::fs::File`, and implements a stream of `Bytes`s reading a portion of the
+/// file given by `range`.
 pub struct FileBytesStreamRange {
     file_stream: FileBytesStream,
     seek_state: FileSeekState,
@@ -76,6 +85,7 @@ pub struct FileBytesStreamRange {
 }
 
 impl FileBytesStreamRange {
+    /// Create a new stream from the given file and range
     pub fn new(file: File, range: HttpRange) -> FileBytesStreamRange {
         FileBytesStreamRange {
             file_stream: FileBytesStream::new_with_limit(file, range.length),
@@ -91,13 +101,6 @@ impl FileBytesStreamRange {
             start_offset: 0,
         }
     }
-}
-
-#[derive(PartialEq, Eq)]
-enum FileSeekState {
-    NeedSeek,
-    Seeking,
-    Reading,
 }
 
 impl Stream for FileBytesStreamRange {
@@ -134,6 +137,9 @@ impl FileBytesStreamRange {
     }
 }
 
+/// Wraps a `tokio::fs::File`, and implements a stream of `Bytes`s reading multiple portions of
+/// the file given by `ranges` using a chunked multipart/byteranges response.  A boundary is
+/// required to separate the chunked components.
 pub struct FileBytesStreamMultiRange {
     file_range: FileBytesStreamRange,
     range_iter: vec::IntoIter<HttpRange>,
@@ -144,6 +150,7 @@ pub struct FileBytesStreamMultiRange {
 }
 
 impl FileBytesStreamMultiRange {
+    /// Create a new stream from the given file, ranges, boundary and file length.
     pub fn new(file: File, ranges: Vec<HttpRange>, boundary: String, file_length: u64) -> FileBytesStreamMultiRange {
         FileBytesStreamMultiRange {
             file_range: FileBytesStreamRange::without_initial_range(file),
@@ -155,6 +162,7 @@ impl FileBytesStreamMultiRange {
         }
     }
 
+    /// Set the Content-Type header in the multipart/byteranges chunks.
     pub fn set_content_type(&mut self, content_type: &str) {
         self.content_type = content_type.to_string();
     }
@@ -215,10 +223,7 @@ impl Stream for FileBytesStreamMultiRange {
             return Poll::Ready(Some(Ok(Bytes::copy_from_slice(read_buf.filled()))))
         }
         
-        match Pin::new(file_range).poll_next(cx) {
-            Poll::Ready(None) => unreachable!(),
-            other => return other,
-        }
+        Pin::new(file_range).poll_next(cx)
     }
 }
 
