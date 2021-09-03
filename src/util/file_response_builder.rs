@@ -35,9 +35,6 @@ pub struct FileResponseBuilder {
     pub if_modified_since: Option<DateTime<LocalTz>>,
     /// The file ranges to read, if any, otherwise we read from the beginning.
     pub range: Option<String>,
-    /// The Content type, this will be added to the response in the main header or
-    /// within part headers as appropriate.
-    pub content_type: Option<String>,
 }
 
 impl FileResponseBuilder {
