@@ -41,14 +41,15 @@ impl Stream for FileBytesStream {
         let Self {
             ref mut file,
             ref mut buf,
-            range_remaining,
+            ref mut range_remaining,
         } = *self;
 
-        let max_read_length = min(range_remaining, buf.len() as u64) as usize;
+        let max_read_length = min(*range_remaining, buf.len() as u64) as usize;
         let mut read_buf = ReadBuf::uninit(&mut buf[..max_read_length]);
         match Pin::new(file).poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {
                 let filled = read_buf.filled();
+                *range_remaining -= filled.len() as u64;
                 if filled.is_empty() {
                     Poll::Ready(None)
                 } else {
@@ -80,6 +81,14 @@ impl FileBytesStreamRange {
             file_stream: FileBytesStream::new_with_limit(file, range.length),
             seek_state: FileSeekState::NeedSeek,
             start_offset: range.start,
+        }
+    }
+
+    fn without_initial_range(file: File) -> FileBytesStreamRange {
+        FileBytesStreamRange {
+            file_stream: FileBytesStream::new_with_limit(file, 0),
+            seek_state: FileSeekState::NeedSeek,
+            start_offset: 0,
         }
     }
 }
@@ -130,20 +139,24 @@ pub struct FileBytesStreamMultiRange {
     range_iter: vec::IntoIter<HttpRange>,
     is_first_boundary: bool,
     boundary: String,
+    content_type: String,
     file_length: u64,
 }
 
 impl FileBytesStreamMultiRange {
     pub fn new(file: File, ranges: Vec<HttpRange>, boundary: String, file_length: u64) -> FileBytesStreamMultiRange {
-        let mut range_iter = ranges.into_iter();
-        let first_range = range_iter.next().expect("ranges must not be empty");
         FileBytesStreamMultiRange {
-            file_range: FileBytesStreamRange::new(file, first_range),
-            range_iter,
+            file_range: FileBytesStreamRange::without_initial_range(file),
+            range_iter: ranges.into_iter(),
             boundary,
             is_first_boundary: true,
+            content_type: String::new(),
             file_length,
         }
+    }
+
+    pub fn set_content_type(&mut self, content_type: &str) {
+        self.content_type = content_type.to_string();
     }
 }
 
@@ -156,6 +169,7 @@ impl Stream for FileBytesStreamMultiRange {
             ref mut range_iter,
             ref mut is_first_boundary,
             ref boundary,
+            ref content_type,
             file_length,
         } = *self;
 
@@ -166,6 +180,7 @@ impl Stream for FileBytesStreamMultiRange {
             };
 
             file_range.seek_state = FileSeekState::NeedSeek;
+            file_range.start_offset = range.start;
             file_range.file_stream.range_remaining = range.length;
 
             let mut read_buf = ReadBuf::uninit(&mut file_range.file_stream.buf[..]);
@@ -177,10 +192,9 @@ impl Stream for FileBytesStreamMultiRange {
             read_buf.put_slice(b"--");
             read_buf.put_slice(boundary.as_bytes());
             read_buf.put_slice(b"\r\nContent-Range: bytes ");
-
-            let mut tmp_buffer = [0; 66];
+            let mut tmp_buffer = [0; 80];
             let mut tmp_storage = Cursor::new(&mut tmp_buffer[..]);
-            write!(&mut tmp_storage, "{}-{}/{}\r\n\r\n",
+            write!(&mut tmp_storage, "{}-{}/{}\r\n",
                 range.start,
                 range.start + range.length - 1,
                 file_length,
@@ -189,6 +203,14 @@ impl Stream for FileBytesStreamMultiRange {
             let end_position = tmp_storage.position() as usize;
             let tmp_storage = tmp_storage.into_inner();
             read_buf.put_slice(&tmp_storage[..end_position]);
+
+            if !content_type.is_empty() {
+                read_buf.put_slice(b"Content-Type: ");
+                read_buf.put_slice(content_type.as_bytes());
+                read_buf.put_slice(b"\r\n");
+            }
+
+            read_buf.put_slice(b"\r\n");
 
             return Poll::Ready(Some(Ok(Bytes::copy_from_slice(read_buf.filled()))))
         }

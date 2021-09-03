@@ -34,7 +34,10 @@ pub struct FileResponseBuilder {
     /// The parsed value of the `If-Modified-Since` request header.
     pub if_modified_since: Option<DateTime<LocalTz>>,
     /// The file ranges to read, if any, otherwise we read from the beginning.
-    pub range: Option<String>, // Vec<HttpRange>,
+    pub range: Option<String>,
+    /// The Content type, this will be added to the response in the main header or
+    /// within part headers as appropriate.
+    pub content_type: Option<String>,
 }
 
 impl FileResponseBuilder {
@@ -90,7 +93,7 @@ impl FileResponseBuilder {
     pub fn if_modified_since_header(&mut self, value: Option<&header::HeaderValue>) -> &mut Self {
         self.if_modified_since = value
             .and_then(|v| v.to_str().ok())
-        .and_then(|v| DateTime::parse_from_rfc2822(v).ok())
+            .and_then(|v| DateTime::parse_from_rfc2822(v).ok())
             .map(|v| v.with_timezone(&LocalTz));
         self
     }
@@ -113,7 +116,7 @@ impl FileResponseBuilder {
     }
 
     /// Build a response for the given file and metadata.
-    pub fn build(&self, file: File, metadata: Metadata) -> Result<Response<Body>> {
+    pub fn build(&self, file: File, metadata: Metadata, content_type: String) -> Result<Response<Body>> {
         let mut res = ResponseBuilder::new();
 
         // Set `Last-Modified` and check `If-Modified-Since`.
@@ -177,8 +180,8 @@ impl FileResponseBuilder {
                                 metadata.len()))
                         .header(header::CONTENT_LENGTH, format!("{}", single_span.length));
 
-                    let body = FileBytesStreamRange::new(file, single_span).into_body();
-                    return res.status(StatusCode::PARTIAL_CONTENT).body(body)
+                    let body_stream = FileBytesStreamRange::new(file, single_span);
+                    return res.status(StatusCode::PARTIAL_CONTENT).body(body_stream.into_body());
                 } else if ranges.len() > 1 {
                     let mut boundary_tmp = [0u8; BOUNDARY_LENGTH];
 
@@ -194,12 +197,20 @@ impl FileResponseBuilder {
                     res = res.header(hyper::header::CONTENT_TYPE,
                         format!("multipart/byteranges; boundary={}", boundary));
 
-                    let body = FileBytesStreamMultiRange::new(file, ranges, boundary, metadata.len()).into_body();
-                    return res.status(StatusCode::PARTIAL_CONTENT).body(body)
+                    let mut body_stream = FileBytesStreamMultiRange::new(file, ranges, boundary, metadata.len());
+                    if !content_type.is_empty() {
+                        body_stream.set_content_type(&content_type);
+                    }
+
+                    return res.status(StatusCode::PARTIAL_CONTENT).body(body_stream.into_body());
                 }
             }
         } else {
             res = res.header(header::CONTENT_LENGTH, format!("{}", metadata.len()));
+        }
+
+        if !content_type.is_empty() {
+            res = res.header(header::CONTENT_TYPE, content_type);
         }
 
         // Stream the body.
