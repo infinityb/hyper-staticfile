@@ -1,15 +1,17 @@
 use futures_util::stream::Stream;
 use http_range::HttpRange;
 use hyper::body::{Body, Bytes};
-use std::io::{Error as IoError, Write, SeekFrom};
+use std::io::{Cursor, Error as IoError, SeekFrom, Write};
 use std::mem::MaybeUninit;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::vec;
+use std::cmp::min;
 use tokio::fs::File;
 use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 
 const BUF_SIZE: usize = 8 * 1024;
+
 
 /// Wraps a `tokio::fs::File`, and implements a stream of `Bytes`s.
 pub struct FileBytesStream {
@@ -42,9 +44,7 @@ impl Stream for FileBytesStream {
             range_remaining,
         } = *self;
 
-        let rr = std::cmp::min(range_remaining, usize::max_value() as u64) as usize;
-        let max_read_length = std::cmp::min(rr, buf.len());
-
+        let max_read_length = min(range_remaining, buf.len() as u64) as usize;
         let mut read_buf = ReadBuf::uninit(&mut buf[..max_read_length]);
         match Pin::new(file).poll_read(cx, &mut read_buf) {
             Poll::Ready(Ok(())) => {
@@ -68,13 +68,6 @@ impl FileBytesStream {
     }
 }
 
-#[derive(PartialEq, Eq)]
-enum FileSeekState {
-    NeedSeek,
-    Seeking,
-    Reading,
-}
-
 pub struct FileBytesStreamRange {
     file_stream: FileBytesStream,
     seek_state: FileSeekState,
@@ -85,11 +78,17 @@ impl FileBytesStreamRange {
     pub fn new(file: File, range: HttpRange) -> FileBytesStreamRange {
         FileBytesStreamRange {
             file_stream: FileBytesStream::new_with_limit(file, range.length),
-            start_offset: range.start,
             seek_state: FileSeekState::NeedSeek,
-            
+            start_offset: range.start,
         }
     }
+}
+
+#[derive(PartialEq, Eq)]
+enum FileSeekState {
+    NeedSeek,
+    Seeking,
+    Reading,
 }
 
 impl Stream for FileBytesStreamRange {
@@ -114,7 +113,6 @@ impl Stream for FileBytesStreamRange {
                 Poll::Pending => return Poll::Pending,
             }
         }
-
         Pin::new(file_stream).poll_next(cx)
     }
 }
@@ -166,25 +164,33 @@ impl Stream for FileBytesStreamMultiRange {
                 Some(r) => r,
                 None => return Poll::Ready(None),
             };
+
             file_range.seek_state = FileSeekState::NeedSeek;
             file_range.file_stream.range_remaining = range.length;
-            let mut mp_header = Vec::new();
 
+            let mut read_buf = ReadBuf::uninit(&mut file_range.file_stream.buf[..]);
             if *is_first_boundary {
                 *is_first_boundary = false;
             } else {
-                write!(&mut mp_header, "\r\n").unwrap();
+                read_buf.put_slice(b"\r\n");
             }
-            write!(
-                &mut mp_header,
-                "--{}\r\nContent-Range: bytes {}-{}/{}\r\n\r\n",
-                boundary,
+            read_buf.put_slice(b"--");
+            read_buf.put_slice(boundary.as_bytes());
+            read_buf.put_slice(b"\r\nContent-Range: bytes ");
+
+            let mut tmp_buffer = [0; 66];
+            let mut tmp_storage = Cursor::new(&mut tmp_buffer[..]);
+            write!(&mut tmp_storage, "{}-{}/{}\r\n\r\n",
                 range.start,
                 range.start + range.length - 1,
                 file_length,
-            ).unwrap();
+            ).expect("buffer unexpectedly too small");
 
-            return Poll::Ready(Some(Ok(mp_header.into())));
+            let end_position = tmp_storage.position() as usize;
+            let tmp_storage = tmp_storage.into_inner();
+            read_buf.put_slice(&tmp_storage[..end_position]);
+
+            return Poll::Ready(Some(Ok(Bytes::copy_from_slice(read_buf.filled()))))
         }
         
         match Pin::new(file_range).poll_next(cx) {

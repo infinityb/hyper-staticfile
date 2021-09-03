@@ -90,8 +90,17 @@ impl FileResponseBuilder {
     pub fn if_modified_since_header(&mut self, value: Option<&header::HeaderValue>) -> &mut Self {
         self.if_modified_since = value
             .and_then(|v| v.to_str().ok())
-            .and_then(|v| DateTime::parse_from_rfc2822(v).ok())
+        .and_then(|v| DateTime::parse_from_rfc2822(v).ok())
             .map(|v| v.with_timezone(&LocalTz));
+        self
+    }
+
+    /// Build responses for the given `If-Range` request header value.
+    pub fn if_range(&mut self, _value: Option<DateTime<LocalTz>>) -> &mut Self {
+        // self.if_range = value
+        //     .and_then(|v| v.to_str().ok())
+        //     .and_then(|v| DateTime::parse_from_rfc2822(v).ok())
+        //     .map(|v| v.with_timezone(&LocalTz));;
         self
     }
 
@@ -166,7 +175,7 @@ impl FileResponseBuilder {
                                 single_span.start,
                                 single_span.start + single_span.length - 1,
                                 metadata.len()))
-                        .header(header::CONTENT_LENGTH, format!("{}", ranges[0].length));
+                        .header(header::CONTENT_LENGTH, format!("{}", single_span.length));
 
                     let body = FileBytesStreamRange::new(file, single_span).into_body();
                     return res.status(StatusCode::PARTIAL_CONTENT).body(body)
