@@ -10,6 +10,7 @@ use tokio::fs::File;
 use http_range::HttpRange;
 use rand::prelude::{thread_rng, SliceRandom};
 
+
 /// Minimum duration since Unix epoch we accept for file modification time.
 ///
 /// This is intended to discard invalid times, specifically:
@@ -35,6 +36,8 @@ pub struct FileResponseBuilder {
     pub if_modified_since: Option<DateTime<LocalTz>>,
     /// The file ranges to read, if any, otherwise we read from the beginning.
     pub range: Option<String>,
+    /// The unparsed value of the `If-Range` request header. May match etag or last-modified.
+    pub if_range: Option<String>,
 }
 
 impl FileResponseBuilder {
@@ -96,11 +99,8 @@ impl FileResponseBuilder {
     }
 
     /// Build responses for the given `If-Range` request header value.
-    pub fn if_range(&mut self, _value: Option<DateTime<LocalTz>>) -> &mut Self {
-        // self.if_range = value
-        //     .and_then(|v| v.to_str().ok())
-        //     .and_then(|v| DateTime::parse_from_rfc2822(v).ok())
-        //     .map(|v| v.with_timezone(&LocalTz));;
+    pub fn if_range(&mut self, value: Option<String>) -> &mut Self {
+        self.if_range = value;
         self
     }
 
@@ -117,12 +117,14 @@ impl FileResponseBuilder {
         let mut res = ResponseBuilder::new();
 
         // Set `Last-Modified` and check `If-Modified-Since`.
-        let modified = metadata.modified().ok().filter(|v| {
+        let modified: Option<DateTime<LocalTz>> = metadata.modified().ok().filter(|v| {
             v.duration_since(UNIX_EPOCH)
                 .ok()
                 .filter(|v| v >= &MIN_VALID_MTIME)
                 .is_some()
         });
+
+        let mut range_cond_ok = true;
         if let Some(modified) = modified {
             let modified: DateTime<LocalTz> = modified.into();
 
@@ -137,17 +139,21 @@ impl FileResponseBuilder {
                 _ => {}
             }
 
+            let etag = format!(
+                "W/\"{0:x}-{1:x}.{2:x}\"",
+                metadata.len(),
+                modified.timestamp(),
+                modified.timestamp_subsec_nanos()
+            );
+
+            if let Some(ref v) = self.if_range {
+                
+                range_cond_ok = *v == modified.to_http_date() || *v == etag;
+            }
+
             res = res
                 .header(header::LAST_MODIFIED, modified.to_http_date())
-                .header(
-                    header::ETAG,
-                    format!(
-                        "W/\"{0:x}-{1:x}.{2:x}\"",
-                        metadata.len(),
-                        modified.timestamp(),
-                        modified.timestamp_subsec_nanos()
-                    ),
-                )
+                .header(header::ETAG, etag)
                 .header(header::ACCEPT_RANGES, "bytes");
         }
 
@@ -160,52 +166,48 @@ impl FileResponseBuilder {
         }
 
         if self.is_head {
+            res = res.header(header::CONTENT_LENGTH, format!("{}", metadata.len()));
             return res.status(StatusCode::OK).body(Body::empty());
         }
 
-        // Compute the ranges now that we have the file size, if we're multipart then
-        // we need a boundary too.
-        if let Some(ref range) = self.range {
-            if let Ok(ranges) = HttpRange::parse(&range, metadata.len()) {
-                if ranges.len() == 1 {
-                    let single_span = ranges[0];
-                    res = res
-                        .header(header::CONTENT_RANGE,
-                            format!("bytes {}-{}/{}",
-                                single_span.start,
-                                single_span.start + single_span.length - 1,
-                                metadata.len()))
-                        .header(header::CONTENT_LENGTH, format!("{}", single_span.length));
+        let ranges = self.range
+            .as_ref()
+            .filter(|_| range_cond_ok)
+            .and_then(|r| HttpRange::parse(r, metadata.len()).ok());
 
-                    let body_stream = FileBytesStreamRange::new(file, single_span);
-                    return res.status(StatusCode::PARTIAL_CONTENT).body(body_stream.into_body());
-                } else if ranges.len() > 1 {
-                    let mut boundary_tmp = [0u8; BOUNDARY_LENGTH];
+        if let Some(ranges) = ranges {
+            if ranges.len() == 1 {
+                let single_span = ranges[0];
+                res = res
+                    .header(header::CONTENT_RANGE, content_range_header(&single_span, metadata.len()))
+                    .header(header::CONTENT_LENGTH, format!("{}", single_span.length));
 
-                    let mut rng = thread_rng();
-                    for v in boundary_tmp.iter_mut() {
-                        // won't panic since BOUNDARY_CHARS is non-empty
-                        *v = *BOUNDARY_CHARS.choose(&mut rng).unwrap();
-                    }
+                let body_stream = FileBytesStreamRange::new(file, single_span);
+                return res.status(StatusCode::PARTIAL_CONTENT).body(body_stream.into_body());
+            } else if ranges.len() > 1 {
+                let mut boundary_tmp = [0u8; BOUNDARY_LENGTH];
 
-                    // won't panic because boundary_tmp is guaranteed to be all ASCII
-                    let boundary = std::str::from_utf8(&boundary_tmp[..]).unwrap().to_string();
-
-                    res = res.header(hyper::header::CONTENT_TYPE,
-                        format!("multipart/byteranges; boundary={}", boundary));
-
-                    let mut body_stream = FileBytesStreamMultiRange::new(file, ranges, boundary, metadata.len());
-                    if !content_type.is_empty() {
-                        body_stream.set_content_type(&content_type);
-                    }
-
-                    return res.status(StatusCode::PARTIAL_CONTENT).body(body_stream.into_body());
+                let mut rng = thread_rng();
+                for v in boundary_tmp.iter_mut() {
+                    // won't panic since BOUNDARY_CHARS is non-empty
+                    *v = *BOUNDARY_CHARS.choose(&mut rng).unwrap();
                 }
-            }
-        } else {
-            res = res.header(header::CONTENT_LENGTH, format!("{}", metadata.len()));
-        }
 
+                // won't panic because boundary_tmp is guaranteed to be all ASCII
+                let boundary = std::str::from_utf8(&boundary_tmp[..]).unwrap().to_string();
+
+                res = res.header(hyper::header::CONTENT_TYPE,
+                    format!("multipart/byteranges; boundary={}", boundary));
+
+                let mut body_stream = FileBytesStreamMultiRange::new(file, ranges, boundary, metadata.len());
+                if !content_type.is_empty() {
+                    body_stream.set_content_type(&content_type);
+                }
+                return res.status(StatusCode::PARTIAL_CONTENT).body(body_stream.into_body());
+            }
+        }
+        
+        res = res.header(header::CONTENT_LENGTH, format!("{}", metadata.len()));
         if !content_type.is_empty() {
             res = res.header(header::CONTENT_TYPE, content_type);
         }
@@ -214,3 +216,9 @@ impl FileResponseBuilder {
         res.status(StatusCode::OK).body(FileBytesStream::new(file).into_body())
     }
 }
+
+fn content_range_header(r: &HttpRange, total_length: u64) -> String {
+    format!("bytes {}-{}/{}", r.start, r.start + r.length - 1, total_length)
+}
+
+

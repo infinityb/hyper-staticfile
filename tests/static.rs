@@ -244,3 +244,19 @@ async fn no_headers_for_invalid_mtime() {
     let res = harness.get("/file1.html").await.unwrap();
     assert!(res.headers().get(header::ETAG).is_none());
 }
+
+
+#[tokio::test]
+async fn serves_file_ranges_beginning() {
+    let harness = Harness::new(vec![("file1.html", "this is file1")]);
+
+    let if_modified = Utc::now() + Duration::seconds(3600);
+    let req = Request::builder()
+        .uri("/file1.html")
+        .header(header::RANGE, "bytes -3")
+        .body(())
+        .expect("unable to build request");
+
+    let res = harness.request(req).await.unwrap();
+    assert_eq!(read_body(res).await, "this");
+}
