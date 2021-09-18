@@ -68,6 +68,7 @@ impl FileResponseBuilder {
     pub fn request_headers(&mut self, headers: &HeaderMap) -> &mut Self {
         self.if_modified_since_header(headers.get(header::IF_MODIFIED_SINCE));
         self.range_header(headers.get(header::RANGE));
+        self.if_range(headers.get(header::IF_RANGE));
         self
     }
 
@@ -99,8 +100,10 @@ impl FileResponseBuilder {
     }
 
     /// Build responses for the given `If-Range` request header value.
-    pub fn if_range(&mut self, value: Option<String>) -> &mut Self {
-        self.if_range = value;
+    pub fn if_range(&mut self, value: Option<&header::HeaderValue>) -> &mut Self {
+        if let Some(s) = value.and_then(|s| s.to_str().ok()) {
+            self.if_range = Some(s.to_string());
+        }
         self
     }
 
@@ -150,6 +153,7 @@ impl FileResponseBuilder {
                 
                 range_cond_ok = *v == modified.to_http_date() || *v == etag;
             }
+
 
             res = res
                 .header(header::LAST_MODIFIED, modified.to_http_date())

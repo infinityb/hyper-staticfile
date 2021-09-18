@@ -144,6 +144,7 @@ pub struct FileBytesStreamMultiRange {
     file_range: FileBytesStreamRange,
     range_iter: vec::IntoIter<HttpRange>,
     is_first_boundary: bool,
+    completed: bool,
     boundary: String,
     content_type: String,
     file_length: u64,
@@ -157,6 +158,7 @@ impl FileBytesStreamMultiRange {
             range_iter: ranges.into_iter(),
             boundary,
             is_first_boundary: true,
+            completed: false,
             content_type: String::new(),
             file_length,
         }
@@ -176,15 +178,29 @@ impl Stream for FileBytesStreamMultiRange {
             ref mut file_range,
             ref mut range_iter,
             ref mut is_first_boundary,
+            ref mut completed,
             ref boundary,
             ref content_type,
             file_length,
         } = *self;
 
+        if *completed {
+            return Poll::Ready(None);
+        }
+
         if file_range.file_stream.range_remaining == 0 {
             let range = match range_iter.next() {
                 Some(r) => r,
-                None => return Poll::Ready(None),
+                None => {
+                    *completed = true;
+
+                    let mut read_buf = ReadBuf::uninit(&mut file_range.file_stream.buf[..]);
+                    read_buf.put_slice(b"\r\n--");
+                    read_buf.put_slice(boundary.as_bytes());
+                    read_buf.put_slice(b"--\r\n");
+
+                    return Poll::Ready(Some(Ok(Bytes::copy_from_slice(read_buf.filled()))))
+                }
             };
 
             file_range.seek_state = FileSeekState::NeedSeek;
@@ -226,6 +242,8 @@ impl Stream for FileBytesStreamMultiRange {
         Pin::new(file_range).poll_next(cx)
     }
 }
+
+// fn write_ending_boundary() -> 
 
 impl FileBytesStreamMultiRange {
     /// Create a Hyper `Body` from this stream.
