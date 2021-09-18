@@ -139,7 +139,8 @@ impl FileBytesStreamRange {
 
 /// Wraps a `tokio::fs::File`, and implements a stream of `Bytes`s reading multiple portions of
 /// the file given by `ranges` using a chunked multipart/byteranges response.  A boundary is
-/// required to separate the chunked components.
+/// required to separate the chunked components and therefore needs to be unlikely to be in any
+/// file.
 pub struct FileBytesStreamMultiRange {
     file_range: FileBytesStreamRange,
     range_iter: vec::IntoIter<HttpRange>,
