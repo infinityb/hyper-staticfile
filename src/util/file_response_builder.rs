@@ -120,7 +120,7 @@ impl FileResponseBuilder {
         let mut res = ResponseBuilder::new();
 
         // Set `Last-Modified` and check `If-Modified-Since`.
-        let modified: Option<DateTime<LocalTz>> = metadata.modified().ok().filter(|v| {
+        let modified = metadata.modified().ok().filter(|v| {
             v.duration_since(UNIX_EPOCH)
                 .ok()
                 .filter(|v| v >= &MIN_VALID_MTIME)
