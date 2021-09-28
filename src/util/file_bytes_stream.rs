@@ -169,6 +169,81 @@ impl FileBytesStreamMultiRange {
     pub fn set_content_type(&mut self, content_type: &str) {
         self.content_type = content_type.to_string();
     }
+
+    /// Computes the length of the body for the multi-range response being produced by this
+    /// `FileBytesStreamMultiRange`.  This function is required to be mutable because it temporarily
+    /// uses pre-allocated buffers.
+    pub fn compute_length(&mut self) -> u64 {
+        let Self {
+            ref mut file_range,
+            ref range_iter,
+            ref boundary,
+            ref content_type,
+            file_length,
+            ..
+        } = *self;
+
+        let mut total_length = 0;
+        let mut is_first = true;
+        for range in range_iter.as_slice() {
+            let mut read_buf = ReadBuf::uninit(&mut file_range.file_stream.buf[..]);
+            render_multipart_header(&mut read_buf, boundary,content_type,
+                                    *range, is_first, file_length);
+
+            is_first = false;
+            total_length += read_buf.filled().len() as u64;
+            total_length += range.length;
+        }
+
+        let mut read_buf = ReadBuf::uninit(&mut file_range.file_stream.buf[..]);
+        render_multipart_header_end(&mut read_buf, boundary);
+        total_length += read_buf.filled().len() as u64;
+
+        total_length
+    }
+}
+
+fn render_multipart_header(
+    read_buf: &mut ReadBuf<'_>,
+    boundary: &str,
+    content_type: &str,
+    range: HttpRange,
+    is_first: bool,
+    file_length: u64,
+) {
+    if !is_first {
+        read_buf.put_slice(b"\r\n");
+    }
+    read_buf.put_slice(b"--");
+    read_buf.put_slice(boundary.as_bytes());
+    read_buf.put_slice(b"\r\nContent-Range: bytes ");
+
+    // 64 is 20 (max length of 64 bit integer) * 3 + 4 (symbols, new line)
+    let mut tmp_buffer = [0; 64];
+    let mut tmp_storage = Cursor::new(&mut tmp_buffer[..]);
+    write!(&mut tmp_storage, "{}-{}/{}\r\n",
+        range.start,
+        range.start + range.length - 1,
+        file_length,
+    ).expect("buffer unexpectedly too small");
+
+    let end_position = tmp_storage.position() as usize;
+    let tmp_storage = tmp_storage.into_inner();
+    read_buf.put_slice(&tmp_storage[..end_position]);
+
+    if !content_type.is_empty() {
+        read_buf.put_slice(b"Content-Type: ");
+        read_buf.put_slice(content_type.as_bytes());
+        read_buf.put_slice(b"\r\n");
+    }
+
+    read_buf.put_slice(b"\r\n");
+}
+
+fn render_multipart_header_end(read_buf: &mut ReadBuf<'_>, boundary: &str) {
+    read_buf.put_slice(b"\r\n--");
+    read_buf.put_slice(boundary.as_bytes());
+    read_buf.put_slice(b"--\r\n");
 }
 
 impl Stream for FileBytesStreamMultiRange {
@@ -196,10 +271,7 @@ impl Stream for FileBytesStreamMultiRange {
                     *completed = true;
 
                     let mut read_buf = ReadBuf::uninit(&mut file_range.file_stream.buf[..]);
-                    read_buf.put_slice(b"\r\n--");
-                    read_buf.put_slice(boundary.as_bytes());
-                    read_buf.put_slice(b"--\r\n");
-
+                    render_multipart_header_end(&mut read_buf, boundary);
                     return Poll::Ready(Some(Ok(Bytes::copy_from_slice(read_buf.filled()))))
                 }
             };
@@ -208,43 +280,25 @@ impl Stream for FileBytesStreamMultiRange {
             file_range.start_offset = range.start;
             file_range.file_stream.range_remaining = range.length;
 
+            let cur_is_first = *is_first_boundary;
+            *is_first_boundary = false;
+
             let mut read_buf = ReadBuf::uninit(&mut file_range.file_stream.buf[..]);
-            if *is_first_boundary {
-                *is_first_boundary = false;
-            } else {
-                read_buf.put_slice(b"\r\n");
-            }
-            read_buf.put_slice(b"--");
-            read_buf.put_slice(boundary.as_bytes());
-            read_buf.put_slice(b"\r\nContent-Range: bytes ");
-            let mut tmp_buffer = [0; 80];
-            let mut tmp_storage = Cursor::new(&mut tmp_buffer[..]);
-            write!(&mut tmp_storage, "{}-{}/{}\r\n",
-                range.start,
-                range.start + range.length - 1,
+            render_multipart_header(
+                &mut read_buf,
+                boundary,
+                content_type,
+                range,
+                cur_is_first,
                 file_length,
-            ).expect("buffer unexpectedly too small");
+            );
 
-            let end_position = tmp_storage.position() as usize;
-            let tmp_storage = tmp_storage.into_inner();
-            read_buf.put_slice(&tmp_storage[..end_position]);
-
-            if !content_type.is_empty() {
-                read_buf.put_slice(b"Content-Type: ");
-                read_buf.put_slice(content_type.as_bytes());
-                read_buf.put_slice(b"\r\n");
-            }
-
-            read_buf.put_slice(b"\r\n");
-
-            return Poll::Ready(Some(Ok(Bytes::copy_from_slice(read_buf.filled()))))
+            return Poll::Ready(Some(Ok(Bytes::copy_from_slice(read_buf.filled()))));
         }
         
         Pin::new(file_range).poll_next(cx)
     }
 }
-
-// fn write_ending_boundary() -> 
 
 impl FileBytesStreamMultiRange {
     /// Create a Hyper `Body` from this stream.

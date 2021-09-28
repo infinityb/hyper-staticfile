@@ -207,6 +207,10 @@ impl FileResponseBuilder {
                 if !content_type.is_empty() {
                     body_stream.set_content_type(&content_type);
                 }
+
+                res = res.header(hyper::header::CONTENT_LENGTH,
+                    format!("{}", body_stream.compute_length()));
+
                 return res.status(StatusCode::PARTIAL_CONTENT).body(body_stream.into_body());
             }
         }
