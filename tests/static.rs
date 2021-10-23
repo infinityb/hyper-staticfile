@@ -3,7 +3,7 @@ use futures_util::stream::StreamExt;
 use http::{header, Request, StatusCode};
 use hyper_staticfile::{DateTimeHttp, Static};
 use std::future::Future;
-use std::io::{Error as IoError, Write, Cursor};
+use std::io::{Cursor, Error as IoError, Write};
 use std::process::Command;
 use std::{fs, str};
 use tempdir::TempDir;
@@ -273,7 +273,6 @@ async fn serves_file_ranges_end() {
     assert_eq!(read_body(res).await, "is file1");
 }
 
-
 #[tokio::test]
 async fn serves_file_ranges_multi() {
     let harness = Harness::new(vec![("file1.html", "this is file1")]);
@@ -285,7 +284,12 @@ async fn serves_file_ranges_multi() {
         .expect("unable to build request");
 
     let res = harness.request(req).await.unwrap();
-    let content_type = res.headers().get(header::CONTENT_TYPE).unwrap().to_str().unwrap();
+    let content_type = res
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .unwrap()
+        .to_str()
+        .unwrap();
     assert!(content_type.starts_with("multipart/byteranges; boundary="));
     let boundary = &content_type[31..];
 
@@ -303,8 +307,31 @@ async fn serves_file_ranges_multi() {
     write!(&mut body_expectation, "is file1\r\n").unwrap();
     write!(&mut body_expectation, "--{}--\r\n", boundary).unwrap();
     let body_expectation = String::from_utf8(body_expectation.into_inner()).unwrap();
-
     assert_eq!(read_body(res).await, body_expectation);
+}
+
+#[tokio::test]
+async fn serves_file_ranges_multi_assert_content_length_correct() {
+    let harness = Harness::new(vec![("file1.html", "this is file1")]);
+
+    let req = Request::builder()
+        .uri("/file1.html")
+        .header(header::RANGE, "bytes=0-3, 5-")
+        .body(())
+        .expect("unable to build request");
+
+    let res = harness.request(req).await.unwrap();
+
+    let content_length: usize = res
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+
+    assert_eq!(read_body(res).await.len(), content_length);
 }
 
 #[tokio::test]
@@ -322,7 +349,6 @@ async fn serves_file_ranges_if_range_negative() {
     // whole thing comes back since If-Range didn't match
     assert_eq!(read_body(res).await, "this is file1");
 }
-
 
 #[tokio::test]
 async fn serves_file_ranges_if_range_etag_positive() {
@@ -346,4 +372,26 @@ async fn serves_file_ranges_if_range_etag_positive() {
 
     let res = harness.request(req).await.unwrap();
     assert_eq!(read_body(res).await, "is file1");
+}
+
+#[tokio::test]
+async fn serves_requested_range_not_satisfiable_when_at_end() {
+    let harness = Harness::new(vec![("file1.html", "this is file1")]);
+
+    // first request goes out without etag to fetch etag
+    let req = Request::builder()
+        .uri("/file1.html")
+        .body(())
+        .expect("unable to build request");
+
+    let res = harness.request(req).await.unwrap();
+
+    let req = Request::builder()
+        .uri("/file1.html")
+        .header(header::RANGE, "bytes=13-")
+        .body(())
+        .expect("unable to build request");
+
+    let res = harness.request(req).await.unwrap();
+    assert_eq!(res.status(), hyper::StatusCode::RANGE_NOT_SATISFIABLE);
 }

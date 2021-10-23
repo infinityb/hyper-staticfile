@@ -12,7 +12,6 @@ use tokio::io::{AsyncRead, AsyncSeek, ReadBuf};
 
 const BUF_SIZE: usize = 8 * 1024;
 
-
 /// Wraps a `tokio::fs::File`, and implements a stream of `Bytes`s.
 pub struct FileBytesStream {
     file: File,
@@ -20,17 +19,24 @@ pub struct FileBytesStream {
     range_remaining: u64,
 }
 
-
 impl FileBytesStream {
     /// Create a new stream from the given file.
     pub fn new(file: File) -> FileBytesStream {
         let buf = Box::new([MaybeUninit::uninit(); BUF_SIZE]);
-        FileBytesStream { file, buf, range_remaining: u64::MAX }
+        FileBytesStream {
+            file,
+            buf,
+            range_remaining: u64::MAX,
+        }
     }
 
     fn new_with_limit(file: File, range_remaining: u64) -> FileBytesStream {
         let buf = Box::new([MaybeUninit::uninit(); BUF_SIZE]);
-        FileBytesStream { file, buf, range_remaining }
+        FileBytesStream {
+            file,
+            buf,
+            range_remaining,
+        }
     }
 }
 
@@ -114,7 +120,9 @@ impl Stream for FileBytesStreamRange {
         } = *self;
         if *seek_state == FileSeekState::NeedSeek {
             *seek_state = FileSeekState::Seeking;
-            if let Err(e) = Pin::new(&mut file_stream.file).start_seek(SeekFrom::Start(start_offset)) {
+            if let Err(e) =
+                Pin::new(&mut file_stream.file).start_seek(SeekFrom::Start(start_offset))
+            {
                 return Poll::Ready(Some(Err(e)));
             }
         }
@@ -128,7 +136,6 @@ impl Stream for FileBytesStreamRange {
         Pin::new(file_stream).poll_next(cx)
     }
 }
-
 
 impl FileBytesStreamRange {
     /// Create a Hyper `Body` from this stream.
@@ -153,7 +160,12 @@ pub struct FileBytesStreamMultiRange {
 
 impl FileBytesStreamMultiRange {
     /// Create a new stream from the given file, ranges, boundary and file length.
-    pub fn new(file: File, ranges: Vec<HttpRange>, boundary: String, file_length: u64) -> FileBytesStreamMultiRange {
+    pub fn new(
+        file: File,
+        ranges: Vec<HttpRange>,
+        boundary: String,
+        file_length: u64,
+    ) -> FileBytesStreamMultiRange {
         FileBytesStreamMultiRange {
             file_range: FileBytesStreamRange::without_initial_range(file),
             range_iter: ranges.into_iter(),
@@ -187,8 +199,14 @@ impl FileBytesStreamMultiRange {
         let mut is_first = true;
         for range in range_iter.as_slice() {
             let mut read_buf = ReadBuf::uninit(&mut file_range.file_stream.buf[..]);
-            render_multipart_header(&mut read_buf, boundary,content_type,
-                                    *range, is_first, file_length);
+            render_multipart_header(
+                &mut read_buf,
+                boundary,
+                content_type,
+                *range,
+                is_first,
+                file_length,
+            );
 
             is_first = false;
             total_length += read_buf.filled().len() as u64;
@@ -221,11 +239,14 @@ fn render_multipart_header(
     // 64 is 20 (max length of 64 bit integer) * 3 + 4 (symbols, new line)
     let mut tmp_buffer = [0; 64];
     let mut tmp_storage = Cursor::new(&mut tmp_buffer[..]);
-    write!(&mut tmp_storage, "{}-{}/{}\r\n",
+    write!(
+        &mut tmp_storage,
+        "{}-{}/{}\r\n",
         range.start,
         range.start + range.length - 1,
         file_length,
-    ).expect("buffer unexpectedly too small");
+    )
+    .expect("buffer unexpectedly too small");
 
     let end_position = tmp_storage.position() as usize;
     let tmp_storage = tmp_storage.into_inner();
@@ -272,7 +293,7 @@ impl Stream for FileBytesStreamMultiRange {
 
                     let mut read_buf = ReadBuf::uninit(&mut file_range.file_stream.buf[..]);
                     render_multipart_header_end(&mut read_buf, boundary);
-                    return Poll::Ready(Some(Ok(Bytes::copy_from_slice(read_buf.filled()))))
+                    return Poll::Ready(Some(Ok(Bytes::copy_from_slice(read_buf.filled()))));
                 }
             };
 
@@ -295,7 +316,7 @@ impl Stream for FileBytesStreamMultiRange {
 
             return Poll::Ready(Some(Ok(Bytes::copy_from_slice(read_buf.filled()))));
         }
-        
+
         Pin::new(file_range).poll_next(cx)
     }
 }

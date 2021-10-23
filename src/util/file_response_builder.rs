@@ -1,15 +1,15 @@
-use super::{FileBytesStream, FileBytesStreamRange, FileBytesStreamMultiRange};
+use super::{FileBytesStream, FileBytesStreamMultiRange, FileBytesStreamRange};
 use crate::util::DateTimeHttp;
 use chrono::{offset::Local as LocalTz, DateTime, SubsecRound};
 use http::response::Builder as ResponseBuilder;
 use http::{header, HeaderMap, Method, Request, Response, Result, StatusCode};
+use http_range::HttpRange;
+use http_range::HttpRangeParseError;
 use hyper::Body;
+use rand::prelude::{thread_rng, SliceRandom};
 use std::fs::Metadata;
 use std::time::{Duration, UNIX_EPOCH};
 use tokio::fs::File;
-use http_range::HttpRange;
-use rand::prelude::{thread_rng, SliceRandom};
-
 
 /// Minimum duration since Unix epoch we accept for file modification time.
 ///
@@ -109,14 +109,17 @@ impl FileResponseBuilder {
 
     /// Build responses for the given `Range` request header value.
     pub fn range_header(&mut self, value: Option<&header::HeaderValue>) -> &mut Self {
-        self.range = value
-            .and_then(|v| v.to_str().ok())
-            .map(|v| v.to_string());
+        self.range = value.and_then(|v| v.to_str().ok()).map(|v| v.to_string());
         self
     }
 
     /// Build a response for the given file and metadata.
-    pub fn build(&self, file: File, metadata: Metadata, content_type: String) -> Result<Response<Body>> {
+    pub fn build(
+        &self,
+        file: File,
+        metadata: Metadata,
+        content_type: String,
+    ) -> Result<Response<Body>> {
         let mut res = ResponseBuilder::new();
 
         // Set `Last-Modified` and check `If-Modified-Since`.
@@ -150,10 +153,8 @@ impl FileResponseBuilder {
             );
 
             if let Some(ref v) = self.if_range {
-                
                 range_cond_ok = *v == modified.to_http_date() || *v == etag;
             }
-
 
             res = res
                 .header(header::LAST_MODIFIED, modified.to_http_date())
@@ -174,20 +175,37 @@ impl FileResponseBuilder {
             return res.status(StatusCode::OK).body(Body::empty());
         }
 
-        let ranges = self.range
-            .as_ref()
-            .filter(|_| range_cond_ok)
-            .and_then(|r| HttpRange::parse(r, metadata.len()).ok());
+        let ranges = self.range.as_ref().filter(|_| range_cond_ok).and_then(|r| {
+            match HttpRange::parse(r, metadata.len()) {
+                Ok(r) => Some(Ok(r)),
+                Err(HttpRangeParseError::NoOverlap) => Some(Err(())),
+                Err(HttpRangeParseError::InvalidRange) => None,
+            }
+        });
 
         if let Some(ranges) = ranges {
+            let ranges = match ranges {
+                Ok(r) => r,
+                Err(()) => {
+                    return res
+                        .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                        .body(Body::empty());
+                }
+            };
+
             if ranges.len() == 1 {
                 let single_span = ranges[0];
                 res = res
-                    .header(header::CONTENT_RANGE, content_range_header(&single_span, metadata.len()))
+                    .header(
+                        header::CONTENT_RANGE,
+                        content_range_header(&single_span, metadata.len()),
+                    )
                     .header(header::CONTENT_LENGTH, format!("{}", single_span.length));
 
                 let body_stream = FileBytesStreamRange::new(file, single_span);
-                return res.status(StatusCode::PARTIAL_CONTENT).body(body_stream.into_body());
+                return res
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .body(body_stream.into_body());
             } else if ranges.len() > 1 {
                 let mut boundary_tmp = [0u8; BOUNDARY_LENGTH];
 
@@ -200,33 +218,44 @@ impl FileResponseBuilder {
                 // won't panic because boundary_tmp is guaranteed to be all ASCII
                 let boundary = std::str::from_utf8(&boundary_tmp[..]).unwrap().to_string();
 
-                res = res.header(hyper::header::CONTENT_TYPE,
-                    format!("multipart/byteranges; boundary={}", boundary));
+                res = res.header(
+                    hyper::header::CONTENT_TYPE,
+                    format!("multipart/byteranges; boundary={}", boundary),
+                );
 
-                let mut body_stream = FileBytesStreamMultiRange::new(file, ranges, boundary, metadata.len());
+                let mut body_stream =
+                    FileBytesStreamMultiRange::new(file, ranges, boundary, metadata.len());
                 if !content_type.is_empty() {
                     body_stream.set_content_type(&content_type);
                 }
 
-                res = res.header(hyper::header::CONTENT_LENGTH,
-                    format!("{}", body_stream.compute_length()));
+                res = res.header(
+                    hyper::header::CONTENT_LENGTH,
+                    format!("{}", body_stream.compute_length()),
+                );
 
-                return res.status(StatusCode::PARTIAL_CONTENT).body(body_stream.into_body());
+                return res
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .body(body_stream.into_body());
             }
         }
-        
+
         res = res.header(header::CONTENT_LENGTH, format!("{}", metadata.len()));
         if !content_type.is_empty() {
             res = res.header(header::CONTENT_TYPE, content_type);
         }
 
         // Stream the body.
-        res.status(StatusCode::OK).body(FileBytesStream::new(file).into_body())
+        res.status(StatusCode::OK)
+            .body(FileBytesStream::new(file).into_body())
     }
 }
 
 fn content_range_header(r: &HttpRange, total_length: u64) -> String {
-    format!("bytes {}-{}/{}", r.start, r.start + r.length - 1, total_length)
+    format!(
+        "bytes {}-{}/{}",
+        r.start,
+        r.start + r.length - 1,
+        total_length
+    )
 }
-
-

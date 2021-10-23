@@ -96,9 +96,10 @@ impl<'a> ResponseBuilder<'a> {
                     .header(header::LOCATION, target)
                     .body(Body::empty())
             }
-            ResolveResult::Found(file, metadata, mime) => self
-                .file_response_builder
-                .build(file, metadata, mime.to_string()),
+            ResolveResult::Found(file, metadata, mime) => {
+                self.file_response_builder
+                    .build(file, metadata, mime.to_string())
+            }
         }
     }
 }
